@@ -10,7 +10,13 @@ from pow_utils import solve_proof
 from base64 import b64encode
 from Crypto.Random import get_random_bytes
 import hashlib
+import signal
+import sys
+import time
+import _log
 
+server_sock = None
+logged_in_user = None
 def load_config():
     with open("config.json") as f:
         return json.load(f)
@@ -20,7 +26,7 @@ def get_user_pass_as_W():
     password = getpass.getpass("Password: ")
     # Derive W from password
     W = derive_password_key(password, b'static_salt') # W with len 32 byte
-    print(f"W {W}")
+    _log.logging.debug(f"W {W}")
     # To loose password to avoid password leak 
     password = None
     return username,W
@@ -38,7 +44,9 @@ def load_server_server_pub_key():
     server_rsa_pub_cipher = PKCS1_OAEP.new(server_pub_key)
     return server_rsa_pub_cipher
 
-def main():
+def client_login():
+    global server_sock
+    global logged_in_user
     config = load_config()
     username,W = get_user_pass_as_W()    
     server_rsa_pub_cipher = load_server_server_pub_key()
@@ -72,10 +80,23 @@ def main():
     }
 
     # Connect to server and send RSA-wrapped login
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((config["server_ip"], config["server_port"]))
-    s.send(json.dumps(cleint_login_payload).encode())
-    print("[✓] Successfully transmission of client's login payload")
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.settimeout(5)  # Optional: set a timeout for connection attempt
+    
+    try:
+        server_sock.connect((config["server_ip"], config["server_port"]))
+        _log.logging.info("[✓] Connected to server.")
+    except socket.timeout:
+        _log.logging.error("⏱ Connection attempt timed out.")
+    except ConnectionRefusedError:
+        _log.logging.error("[X] Connection refused — is the server running?")
+    except OSError as e:
+        _log.logging.error(f"[!] OS error occurred: {e}")
+        cleanup()
+
+    send_tlv(server_sock, LOGIN_FRAME_T, json.dumps(cleint_login_payload).encode())
+    # server_sock.send(json.dumps(cleint_login_payload).encode())
+    _log.logging.info("[✓] Successfully transmission of client's login payload")
     #exit()
 
     '''
@@ -84,45 +105,45 @@ def main():
     c_rsa_priv_key = RSA.import_key(c_rsa_priv)
     client_rsa_priv_cipher = PKCS1_OAEP.new(c_rsa_priv_key)
     # Receive encrypted W{g^b mod p} and server pub key
-    server_login_payload = json.loads(s.recv(4096).decode())
+    server_login_payload = json.loads(server_sock.recv(4096).decode())
     server_login_sub_payload = {}
     try:
         if server_login_payload["type"] == "login":
+            _log.logging.info("[✓] Successfully reception of server's login payload")
             '''
             Perfect Forward Secrecy
             '''
             server_login_aes_key = client_rsa_priv_cipher.decrypt(b64decode(server_login_payload["rsa_enc_server_login_aes_key"]))
-            #print(f"server_login_aes_key {server_login_aes_key}")
+            #_log.logging.debug(f"server_login_aes_key {server_login_aes_key}")
             received_server_login_sub_payload = json.loads(aes_decrypt(server_login_aes_key, b64decode(server_login_payload["aes_enc_server_login_sub_payload"])).decode())
 
             enc_gb = b64decode(received_server_login_sub_payload["Wgb"])
             server_login_sub_payload["gb"] = int(aes_decrypt(W,enc_gb))
             dh_shared_K = compute_shared_secret(server_login_sub_payload["gb"], a, p)
             dh_shared_K_bytes = dh_shared_K.to_bytes((dh_shared_K.bit_length() + 7) // 8, 'big')
-            #print(f"Shared key bit length: {dh_shared_K.bit_length()}")
+            #_log.logging.debug(f"Shared key bit length: {dh_shared_K.bit_length()}")
             dh_shared_K_bytes = hashlib.sha256(dh_shared_K.to_bytes((dh_shared_K.bit_length() + 7) // 8, 'big')).digest()
             if (dh_shared_K_bytes):
-                print("[✓] Shared DH secret K established.")
-            #print(f"dh_shared_k_bytes {dh_shared_K_bytes}")
+                _log.logging.info("[✓] Shared DH secret K established.")
+            #_log.logging.debug(f"dh_shared_k_bytes {dh_shared_K_bytes}")
             a = g_a = 0 # Forget private and public DH keys for PFS
             
             server_login_sub_payload["time"] = received_server_login_sub_payload["time"]
-            print("[✓] Successfully reception of server's login payload")
-
+            
             '''
             Proof Of Work
             '''
             # Receive encrypted challenge from server (using K)
-            enc_challenge = s.recv(4096)
+            enc_challenge = server_sock.recv(4096)
             challenge_json = json.loads(aes_decrypt(dh_shared_K_bytes, enc_challenge).decode())
-            #print(f"challenge_json {challenge_json}")
-            #print(f"[CHALLENGE] Solve {challenge_json['challenge']} with difficulty {challenge_json['difficulty']}")
+            #_log.logging.debug(f"challenge_json {challenge_json}")
+            #_log.logging.debug(f"[CHALLENGE] Solve {challenge_json['challenge']} with difficulty {challenge_json['difficulty']}")
 
             # Solve and respond with encrypted proof
             nonce = solve_proof(challenge_json["challenge"], challenge_json["difficulty"])
             enc_nonce = aes_encrypt(dh_shared_K_bytes, json.dumps({"nonce": nonce}).encode())
-            s.send(enc_nonce)
-            print("[✓] Successfully Transmission of Proof-Of-Work")
+            server_sock.send(enc_nonce)
+            _log.logging.info("[✓] Successfully Transmission of Proof-Of-Work")
 
             '''
             Session Key Exchange
@@ -131,58 +152,107 @@ def main():
             # Step 1: Generate session key SK and random c3
             session_key_SK = get_random_bytes(32)
             c3 = random.randint(100, 999)
-            #print(f"c3 {c3}")
+            #_log.logging.debug(f"c3 {c3}")
             encrypted_c3 = aes_encrypt(session_key_SK, json.dumps({"c3": c3}).encode())
             msg1 = {
                 "SK": b64encode(session_key_SK).decode(),
                 "enc_c3": b64encode(encrypted_c3).decode()
             }
             enc_msg1 = aes_encrypt(dh_shared_K_bytes, json.dumps(msg1).encode())
-            #print(f"enc_msg1 {enc_msg1}")
-            s.send(enc_msg1)
+            #_log.logging.debug(f"enc_msg1 {enc_msg1}")
+            server_sock.send(enc_msg1)
 
             # Step 2: Receive and decrypt server response
-            enc_msg2 = s.recv(2048)
+            enc_msg2 = server_sock.recv(2048)
             msg2 = json.loads(aes_decrypt(dh_shared_K_bytes, enc_msg2).decode())
             enc_response = b64decode(msg2["enc_response"])
             response = json.loads(aes_decrypt(session_key_SK, enc_response).decode())
     
             if response["c3_check"] != c3 - 1:
-                print("[X] c3 verification failed.")
-                s.close()
-                return
+                _log.logging.error("[X] c3 verification failed.")
+                cleanup()
             c4 = response["c4"]
             
             # Step 3: Send SK_check = c4 - 1 encrypted with SK, then with shared_K
             enc_msg3 = aes_encrypt(session_key_SK, json.dumps({"c4_check": c4 - 1}).encode())
             final_msg = aes_encrypt(dh_shared_K_bytes, json.dumps({"enc_c4_check": b64encode(enc_msg3).decode()}).encode())
-            s.send(final_msg)
+            server_sock.send(final_msg)
 
-            print(f"[+] Final session key established: {session_key_SK.hex()}")
-            
-            time.sleep(5)
-            exit()
+            _log.logging.info(f"[+] Final session key established: {session_key_SK.hex()}")
+            logged_in_user = username
+            return server_sock, session_key_SK
         else:
-            s.send(b"Error: expecting login type frame from server")
-            s.close()    
-            return
+            server_sock.send(b"Error: expecting login type frame from server")
+            cleanup()
     except Exception as e:
-        print(f"[ERROR] {e}")
+        _log.logging.error(f"[ERROR] {e}")
         raise
-
     
-
-
-
-
+def get_list_from_server(server: socket.socket, session_key_SK):
     
+    # Send List Command
+    request = aes_encrypt(session_key_SK, json.dumps({"command": "list", "time": time.time()}).encode())
+    send_tlv(server, LIST_FRAME_T, request)
+    type_, msg = recv_tlv(server)
+    if type_ == LIST_FRAME_T:
+        response = json.loads(aes_decrypt(session_key_SK, msg).decode())
+        # _log.logging.debug(f"User List From Server : \n{response}")
+        return response
+    else:
+        _log.logging.error(f"Error: Unexpected resposne from server with type {type_}")
+        return None
 
 
-    s.close()
+def get_service(server: socket.socket, session_key_SK, command):
+    if command == "list":
+        return get_list_from_server(server, session_key_SK)
+    else:
+        return None
+    
+def show_c_list(c_dict:dict):
+    for user in c_dict.values():
+        print(f"Name: {user['username']:<13} IP: {user['ip']:<15} Port: {user['port']:<5}")
+
+supported_cmd_list = ['list', 'user <username>', 'help']
+def main():
+    server, session_key_SK = client_login()
+    while True and server:
+        command = input("cmd>")
+        if command == "help":
+            _log.logging.info(f"Supported command list -> {supported_cmd_list}")
+        elif command == "list":
+            c_dict = get_service(server, session_key_SK, command)
+            if c_dict  == None:
+                break
+            show_c_list(c_dict)
+        elif command == "user":
+            pass
+        else:
+            _log.logging.error(f"Error: Unexpected command {command}")
+            _log.logging.info(f"Supported command list -> {supported_cmd_list}")
+    cleanup()
+    
+def cleanup():
+    global server_sock
+    _log.logging.info("[🧹] Cleaning up resources...")
+    if server_sock != None :
+        _log.logging.info("[🧹] Closing Server Socket For Graceful Termination")
+        server_sock.close()
+        time.sleep(1)
+    # Close sockets, save files, etc.
+    sys.exit(0)
+
+def signal_signint_handler(sig, frame):
+    _log.logging.info("🔴 Caught Ctrl+C (SIGINT)")
+    cleanup()
+
 
 if __name__ == "__main__":
-    try: 
+    _log.logging.debug("============== Client ============== ")
+    try:
+        signal.signal(signal.SIGINT, signal_signint_handler)
         main()
     except Exception as e:
-        print(f"[ERROR] {e}")
+        _log.logging.error(f"[ERROR] {e}")
+        cleanup()
         raise
