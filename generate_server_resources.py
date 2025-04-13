@@ -80,7 +80,7 @@ def create_keys():
     logging.info("[KEYGEN] Keys saved.")
     return key, password
 
-#password: BostonCommon@24    
+#password: 123
 if __name__ == "__main__":
     key, password = create_keys()
     create_user_db_record(password)

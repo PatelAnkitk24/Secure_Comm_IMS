@@ -22,6 +22,7 @@ import getpass
 import logging
 import pickle
 import server_resources
+import aDoS
 
 server_sock = None
 # Simulated weak password database for demo (in real systems, this would be hashed and salted)
@@ -58,6 +59,7 @@ def client_login(conn: socket.socket, addr):
         if type_ != LOGIN_FRAME_T:
             _log.logging.error("Error: Not A Login Frame")
             send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, b"[X] Error: Not A Login Frame")
+            aDoS.update_observed_ip_dict(addr[0], "unexpected_tag")
             conn.close()
             return None
         client_login_payload = json.loads(decoded_login_payload.decode())
@@ -75,6 +77,7 @@ def client_login(conn: socket.socket, addr):
                 if is_user_in(online_users_sharable, client_login_sub_payload["username"]):
                     _log.logging.error("[X] Error: User Already Logged in")
                     send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, b"[X] Error: User Already Logged in")
+                    aDoS.update_observed_ip_dict(addr[0], "dup_login")
                     conn.close()
                     return None
                 
@@ -84,6 +87,7 @@ def client_login(conn: socket.socket, addr):
                     _log.logging.error("[X] Error: User not found")
                     send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"Error: User not found"))
                     conn.close()
+                    aDoS.update_observed_ip_dict(addr[0], "no_user")
                     return None
                 enc_ga = b64decode(received_client_login_sub_payload["Wga"])
                 try:
@@ -92,6 +96,7 @@ def client_login(conn: socket.socket, addr):
                     send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"Error: Wrong Password"))
                     # _log.logging.error(f"[ERROR] {e}")
                     _log.logging.error(f"[ERROR]  Wrong Password")
+                    aDoS.update_observed_ip_dict(addr[0], "failed_pass")
                     conn.close()
                     return None
                     # traceback.print_exc()
@@ -106,6 +111,7 @@ def client_login(conn: socket.socket, addr):
                 if is_a_replay(client_login_sub_payload["time"]):
                     _log.logging.error("Error: [REPLAY] Timestamp expired.")
                     send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"Error: Timestamp too old."))
+                    aDoS.update_observed_ip_dict(addr[0], "replay")
                     conn.close()
                     return None
                 _log.logging.info("[✓] Successfully reception of client's login payload")
@@ -158,6 +164,7 @@ def client_login(conn: socket.socket, addr):
             else:
                 _log.logging.error("Error: expecting login type frame")
                 send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"Error: expecting login type frame"))
+                aDoS.update_observed_ip_dict(addr[0], "unexpected_type")
                 conn.close()
                 return None
             
@@ -176,10 +183,12 @@ def client_login(conn: socket.socket, addr):
             type_, received_login_payload  = recv_tlv(conn)
             if type_ == LOGIN_ERR_MSG_FRAME_T:
                 _log.logging.error(f"[✓] Login Failed With Message From Client : {decoded_login_payload.decode()}")
+                aDoS.update_observed_ip_dict(addr[0], "error_type")
                 conn.close()
                 return None
             if type_ != LOGIN_FRAME_T:
                 _log.logging.error("Error: Not A Login Frame")
+                aDoS.update_observed_ip_dict(addr[0], "unexpected_tag")
                 conn.close()
                 return None
             nonce_data = json.loads(aes_decrypt(dh_shared_K_bytes, received_login_payload).decode())
@@ -187,6 +196,7 @@ def client_login(conn: socket.socket, addr):
             if not validate_proof(prefix, nonce_data.get("nonce"), difficulty):
                 _log.logging.error("Error: Invalid PoW-Response")
                 send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"Error: Invalid PoW-Response"))
+                aDoS.update_observed_ip_dict(addr[0], "invalid_pow")
                 conn.close()
                 return None
             send_tlv(conn, LOGIN_FRAME_T, aes_encrypt(dh_shared_K_bytes,(b"Correct PoW-Response")))
@@ -199,10 +209,12 @@ def client_login(conn: socket.socket, addr):
             type_, received_login_payload  = recv_tlv(conn)
             if type_ == LOGIN_ERR_MSG_FRAME_T:
                 _log.logging.error(f"[✓] Login Failed With Message From Client : {decoded_login_payload.decode()}")
+                aDoS.update_observed_ip_dict(addr[0], "error_type")
                 conn.close()
                 return None
             if type_ != LOGIN_FRAME_T:
                 _log.logging.error("Error: Not A Login Frame")
+                aDoS.update_observed_ip_dict(addr[0], "unexpected_tag")
                 conn.close()
                 return None
             #_log.logging.debug(f"enc_msg1 {enc_msg1}")
@@ -230,10 +242,12 @@ def client_login(conn: socket.socket, addr):
             type_, received_login_payload  = recv_tlv(conn)
             if type_ == LOGIN_ERR_MSG_FRAME_T:
                 _log.logging.error(f"[✓] Login Failed With Message From Client : {decoded_login_payload.decode()}")
+                aDoS.update_observed_ip_dict(addr[0], "error_type")
                 conn.close()
                 return None
             if type_ != LOGIN_FRAME_T:
                 _log.logging.error("Error: Not A Login Frame")
+                aDoS.update_observed_ip_dict(addr[0], "unexpected_tag")
                 conn.close()
                 return None
             msg3 = json.loads(aes_decrypt(dh_shared_K_bytes, received_login_payload).decode())
@@ -243,6 +257,7 @@ def client_login(conn: socket.socket, addr):
             if c4_check != c4 - 1:
                 _log.logging.error("[X] c4 verification failed.")
                 send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"[X] c4 verification failed."))
+                aDoS.update_observed_ip_dict(addr[0], "challenge_failed")
                 conn.close()
                 return None
             else:
@@ -414,6 +429,7 @@ def handle_client(conn: socket.socket, addr):
     except Exception as e:
         remove_client_from_online_list(addr[0],addr[1])
         _log.logging.error(f"[ERROR] {e}")
+        aDoS.update_observed_ip_dict(addr[0], "misc")
         conn.close()
         traceback.print_exc()
     finally:
@@ -429,7 +445,11 @@ def start_server():
     _log.logging.info(f"[SERVER] Listening on port {u_config_['server_port']} ...")
     while True:
         conn, addr = server_sock.accept()
-        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+        if addr[0] not in aDoS.blocked_ip_list:
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+        else:
+            _log.logging.info(f"[SERVER] Connection from IP {addr[0]} is blocked")
+            conn.close()
 
 def cleanup():
     global server_sock
@@ -450,4 +470,7 @@ if __name__ == "__main__":
     key, password = server_resources.load_keys()
     user_db = server_resources.load_user_db_record(password)
     signal.signal(signal.SIGINT, signal_signint_handler)
+    aDoS.start_ip_monitor_for_every(0.2)
     start_server()
+    
+    

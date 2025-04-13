@@ -27,8 +27,6 @@ def cleanup():
     if lc_sock != None :
         _log.logging.info("[🧹] Closing listening client Socket For Graceful Termination")
         lc_sock.close()
-        time.sleep(1)
-    pass
 
 def remote_client_auth(conn, addr):
     try:
@@ -175,8 +173,11 @@ def listening_client(ip):
             threading.Thread(target=handle_lc_client, args=(conn, addr), daemon=True).start()
     except Exception as e:
         _log.logging.error(f"[ERROR] {e}")
+        _log.logging.error(f"[ERROR] Failed to start client listening server")
         traceback.print_exc()
         cleanup()
+        _log.logging.error("🔪 Sending SIGINT (like Ctrl+C)...")
+        os.kill(os.getpid(), signal.SIGINT)
 
 
 def start_listening_client(ip):

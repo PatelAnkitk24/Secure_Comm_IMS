@@ -435,7 +435,11 @@ def main(c_ip):
         elif command == "help":
             _log.logging.info(f"Supported command list -> {supported_cmd_list}")
         elif command == "list":
-            client_resources.update_remote_client_dict(get_service(server, session_key_SK, command))
+            list_ = get_service(server, session_key_SK, command)
+            if list_ == None:
+                _log.logging.info(f"[✓] Requested list but server failed to respond ...")
+                cleanup()
+            client_resources.update_remote_client_dict(list_)
             if client_resources.remote_client_dict["list"]  == None:
                 continue
             client_resources.show_c_list(client_resources.remote_client_dict["list"])

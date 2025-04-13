@@ -70,6 +70,9 @@ def get_list_from_server(server: socket.socket, session_key_SK):
         response = json.loads(aes_decrypt(session_key_SK, msg).decode())
         # _log.logging.debug(f"User List From Server : \n{response}")
         return response
+    if type_ == None:
+        _log.logging.error(f"Error: Unexpected resposne from server with type {type_}")
+        return None
     else:
         _log.logging.error(f"Error: Unexpected resposne from server with type {type_}")
         return None
