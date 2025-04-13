@@ -23,7 +23,6 @@ import traceback
 
 live_client_session = {}
 
-
 def get_user_pass_as_W():
     username = input("Username: ")
     password = getpass.getpass("Password: ")
@@ -290,10 +289,13 @@ def connect_to_remote_user(user,c_ip):
         _log.logging.info(f"[✓] Connected to remote client with IP {rc_ip}, Port {rc_port}.")
     except socket.timeout:
         _log.logging.error("⏱ Connection attempt timed out.")
+        return None
     except ConnectionRefusedError:
         _log.logging.error(f"[X] Connection refused by user {remote_user_name} on IP {rc_ip} Port {rc_port} — is the server running?")
+        return None
     except OSError as e:
         _log.logging.error(f"[!] OS error occurred: {e}")
+        return None
    # remote_client_cleanup(name)
 
     send_tlv(remote_client_sock, RC_AUTH_FRAME_T, json.dumps(this_client_auth_payload).encode())
@@ -325,12 +327,15 @@ def connect_to_remote_user(user,c_ip):
         return None
     remote_client_user_name = received_remote_client_auth_sub_payload["username"]
     if remote_client_user_name != remote_user_name:
-            _log.logging.error(f"Error: remote_client usernmae mistmatch received user name {remote_client_user_name}, requested user name {remote_user_name}")
-            remote_client_sock.close()
+        _log.logging.error(f"Error: remote_client usernmae mistmatch received user name {remote_client_user_name}, requested user name {remote_user_name}")
+        remote_client_sock.close()
+        return None
+
     enc_c1_check = b64decode(received_remote_client_auth_sub_payload["c1_check"])
     c1_resp = json.loads(aes_decrypt(c2c_session_key_SK, enc_c1_check).decode())["c1_resp"]
     if c1_resp != c1 - 1:
         _log.logging.error("[X] c1 verification failed.")
+        return None
     _log.logging.info(f"[✓] Successfully reception of remote client auth payload from {remote_client_user_name} ")
     
     '''
@@ -355,17 +360,22 @@ def connect_to_remote_user(user,c_ip):
     }
     send_tlv(remote_client_sock, RC_AUTH_FRAME_T, json.dumps(this_client_auth_pow_resp_payload).encode())
 
+    client_resources.remote_client_session_dict[remote_client_user_name] = {"sock":remote_client_sock, "SK":c2c_session_key_SK}
     # client_resources.server_sock.send(json.dumps(remote_client_login_payload).encode())
     _log.logging.info(f"[✓] Successfully transmission of remote client's auth pow-response payload from {client_resources.logged_in_user} to {remote_user_name}")    
     _log.logging.info(f"[+] Authenticated {remote_client_user_name} and established secure session.")
+    return 0
     
-supported_cmd_list = ['list', 'user <username>', 'help']
+supported_cmd_list = ['list', 'user <username> <msg>', 'help']
 def main(c_ip):
     server, session_key_SK = client_login(c_ip)
     client_resources.s_c_session_key_SK = session_key_SK
+    client_resources.update_remote_client_dict(get_service(server, session_key_SK, "list"))
     while True and server:
         command = input("cmd>")
-        if command == "help":
+        if command == '':
+            continue
+        elif command == "help":
             _log.logging.info(f"Supported command list -> {supported_cmd_list}")
         elif command == "list":
             client_resources.update_remote_client_dict(get_service(server, session_key_SK, command))
@@ -373,24 +383,52 @@ def main(c_ip):
                 continue
             client_resources.show_c_list(client_resources.remote_client_dict["list"])
         elif "user " in command:
-            split_string = command.split()
+            split_string = command.split(" ",2)
+            msg = split_string[2]
             client_resources.update_remote_client_dict(get_service(server, session_key_SK, "list"))
-            user = client_resources.get_user_from_dict(split_string[1])
+            user = client_resources.get_user_from_remote_client_dict(split_string[1])
             if split_string[1] == client_resources.logged_in_user:
                 _log.logging.error(f"Can't connect to ownself {user['username']}, check list and try again")
                 continue
             if user:
-                client_resources.show_c_list(client_resources.remote_client_dict["list"])
                 # session_with_user()
-                connect_to_remote_user(user,c_ip)
+                client_resources.update_client_session_resources_against(client_resources.remote_client_dict["list"])
+                if user['username'] not in client_resources.remote_client_session_dict:
+                    if connect_to_remote_user(user,c_ip) != None:
+                        u_name = user['username']
+                        if msg:
+                            payload = {'username': client_resources.logged_in_user, 'time': time.time(), 'msg': msg }
+                            enc_payload = aes_encrypt(client_resources.remote_client_session_dict[u_name]["SK"], json.dumps(payload).encode())
+                            try:
+                                send_tlv(client_resources.remote_client_session_dict[u_name]["sock"], C2C_MSG_FRAME_T, enc_payload)
+                            except Exception as e:
+                                remote_client_sock = client_resources.remote_client_session_dict[u_name]["sock"]
+                                remote_client_sock.close()
+                                client_resources.del_client_from_client_session_resources(u_name)
+                    else:
+                        _log.logging.error(f"Failed to establish secure channel with remote user {u_name}, check list and try again")
+                        continue
+                else:
+                    u_name = user['username']
+                    if msg:
+                            payload = {'username': client_resources.logged_in_user, 'time': time.time(), 'msg': msg }
+                            enc_payload = aes_encrypt(client_resources.remote_client_session_dict[u_name]["SK"], json.dumps(payload).encode())
+                            try:
+                                send_tlv(client_resources.remote_client_session_dict[u_name]["sock"], C2C_MSG_FRAME_T, enc_payload)
+                            except Exception as e:
+                                remote_client_sock = client_resources.remote_client_session_dict[u_name]["sock"]
+                                remote_client_sock.close()
+                                client_resources.del_client_from_client_session_resources(u_name)
+                    else:
+                        _log.logging.error(f"Can't send empty message, try again")
+                        continue
             else:
-                _log.logging.error(f"Can't connect to user {user['username']}, check list and try again")
+                _log.logging.error(f"Can't connect to user {split_string[1]}, check list and try again")
                 continue
-        elif command == "user":
-            pass
         else:
             _log.logging.error(f"Error: Unexpected command {command}")
             _log.logging.info(f"Supported command list -> {supported_cmd_list}")
+            continue
     cleanup()
 
 def get_interface_ip(interface_name):

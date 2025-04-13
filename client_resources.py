@@ -28,6 +28,7 @@ this_client_eph_priv = None
 this_client_rsa_priv_cipher = None
 this_client_rsa_pub_cipher = None
 remote_client_dict = {"list": None}
+remote_client_session_dict = {}
 
 def gen_eph_rsa_keys():
     key = RSA.generate(4096)
@@ -51,7 +52,7 @@ def show_c_list(c_dict:dict):
     for user in c_dict.values():
         print(f"Name: {user['username']:<13} IP: {user['ip']:<15} Port: {user['port']:<5}")
     
-def get_user_from_dict(name):
+def get_user_from_remote_client_dict(name):
     for user in remote_client_dict["list"].values():
         if user['username'] == name:
             return user
@@ -73,3 +74,18 @@ def get_list_from_server(server: socket.socket, session_key_SK):
         _log.logging.error(f"Error: Unexpected resposne from server with type {type_}")
         return None
 
+def update_client_session_resources_against(dict_):
+    to_remove = []
+
+    # Find usernames in remote_client_session_dict that are not in dict_
+    for user in remote_client_session_dict:
+        if user not in dict_:
+            to_remove.append(user['username'])
+
+    # Remove them after iteration (safe removal)
+    for username in to_remove:
+        del remote_client_session_dict[username]
+        print(f"[INFO] Removed stale client session for '{username}'")
+
+def del_client_from_client_session_resources(u_name):
+    del remote_client_session_dict[u_name]

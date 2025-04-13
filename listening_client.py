@@ -63,7 +63,7 @@ def remote_client_auth(conn, addr):
         '''
         Prepare this client auth payload
         '''
-        remote_user_dict = client_resources.get_user_from_dict(remote_client_user_name)
+        remote_user_dict = client_resources.get_user_from_remote_client_dict(remote_client_user_name)
         if remote_user_dict == None:
             _log.logging.info(f"[✓] Unable to find userinfo for {remote_client_user_name}")
             conn.close()
@@ -126,21 +126,31 @@ def remote_client_auth(conn, addr):
             return None
         _log.logging.info("[✓] Successfully Verification of Proof-Of-Work")
         _log.logging.info(f"[+] Authenticated {remote_client_user_name} and established secure session.")
-        return 0
+        return 0, c2c_session_key_SK
     except Exception as e:
         _log.logging.error(f"[ERROR] {e}")
         traceback.print_exc()
         raise
 
-def c2c_session():
-    pass
+def c2c_session(conn, c2c_session_key_SK):
+    try:
+        while True:
+            type_, enc_payload  = recv_tlv(conn)
+            if type_ != C2C_MSG_FRAME_T:
+                _log.logging.error("Error: Not A Remote Client Message Frame")
+                return None
+            payload = json.loads(aes_decrypt(c2c_session_key_SK, enc_payload).decode())
+            _log.logging.info(f"Message: From {payload['username']}, msg: '{payload['msg']}'")
+    except Exception as e:
+        _log.logging.error(f"[ERROR] {e}")
+        conn.close()
 
 def handle_lc_client(conn: socket.socket, addr):
     try: 
         client_resources.update_remote_client_dict(client_resources.get_list_from_server(client_resources.server_sock, client_resources.s_c_session_key_SK))
-        response = remote_client_auth(conn, addr)
+        response, c2c_session_key_SK = remote_client_auth(conn, addr)
         if response == 0:
-            c2c_session()
+            c2c_session(conn, c2c_session_key_SK)
             # serve_to_client(conn, addr)
             pass
         else:
