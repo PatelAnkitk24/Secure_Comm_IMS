@@ -20,6 +20,9 @@ import argparse
 import psutil
 import client_resources
 import traceback
+import readline
+import os
+import atexit
 
 live_client_session = {}
 
@@ -365,14 +368,68 @@ def connect_to_remote_user(user,c_ip):
     _log.logging.info(f"[✓] Successfully transmission of remote client's auth pow-response payload from {client_resources.logged_in_user} to {remote_user_name}")    
     _log.logging.info(f"[+] Authenticated {remote_client_user_name} and established secure session.")
     return 0
+
+def logout_client(logged_in_user, session_key_SK):
+    logout_payload = {
+        "command": "logout",
+        "username": logged_in_user,
+        "time": time.time()
+    }
+    enc_msg = aes_encrypt(session_key_SK, json.dumps(logout_payload).encode())
+    send_tlv(client_resources.server_sock, LOGOUT_FRAME_1_T, enc_msg)
+
+    '''
+    Get response from server
+    '''
+    type_, enc_msg = recv_tlv(client_resources.server_sock)
+    if type_ == LOGIN_ERR_MSG_FRAME_T:
+        _log.logging.error(f"[X] Logout Failed With Message From Server : {enc_msg.decode()}")
+    elif type_ != LOGOUT_FRAME_1_T:
+        _log.logging.error(f"Error: Unknown frame {type_} from Server")
+    else:
+        request = json.loads(aes_decrypt(session_key_SK, enc_msg).decode())
+        if request["command"] != "logout":
+            _log.logging.error(f"Error: Unknown command {request['command'] } from Server")
+        elif request["username"] != "server":
+            _log.logging.error(f"Error: Unknown name {request['username']}")
+        elif is_a_replay(request["time"]):
+            _log.logging.error(f"Error: Replay attack from Rogue Server")    
+        else:    
+            logout_payload = {
+                "command": "logout",
+                "username": logged_in_user,
+                "time": time.time()
+            }
+            enc_msg = aes_encrypt(session_key_SK, json.dumps(logout_payload).encode())
+            send_tlv(client_resources.server_sock, LOGOUT_FRAME_2_T, enc_msg)
+            
+            type_, enc_msg = recv_tlv(client_resources.server_sock)
+            if type_ == LOGIN_ERR_MSG_FRAME_T:
+                _log.logging.error(f"[X] Logout Failed With Message From Server : {enc_msg.decode()}")
+            elif type_ != LOGOUT_FRAME_2_T:
+                _log.logging.error(f"Error: Unknown frame {type_} from Server")
+            else:
+                request = json.loads(aes_decrypt(session_key_SK, enc_msg).decode())
+                if request["command"] != "logout":
+                    _log.logging.error(f"Error: Unknown command {request['command'] } from Server")
+                elif request["username"] != "server":
+                    _log.logging.error(f"Error: Unknown name {request['username']}")
+                elif is_a_replay(request["time"]):
+                    _log.logging.error(f"Error: Replay attack from Rogue Server")    
+                else:  
+                    _log.logging.info(f"[✓] Logout Successful ...")
+                    cleanup()
     
-supported_cmd_list = ['list', 'user <username> <msg>', 'help']
+    _log.logging.error(f"Error: Logut Failed ...")
+    return None
+
+supported_cmd_list = ['list', 'user <username> <msg>', 'logout', 'help']
 def main(c_ip):
     server, session_key_SK = client_login(c_ip)
     client_resources.s_c_session_key_SK = session_key_SK
     client_resources.update_remote_client_dict(get_service(server, session_key_SK, "list"))
     while True and server:
-        command = input("cmd>")
+        command = input(f"{client_resources.logged_in_user}>")
         if command == '':
             continue
         elif command == "help":
@@ -382,9 +439,14 @@ def main(c_ip):
             if client_resources.remote_client_dict["list"]  == None:
                 continue
             client_resources.show_c_list(client_resources.remote_client_dict["list"])
+        elif command == "logout":
+            logout_client(client_resources.logged_in_user, session_key_SK)
         elif "user " in command:
             split_string = command.split(" ",2)
-            msg = split_string[2]
+            if len(split_string) == 3:
+                msg = split_string[2]
+            else:
+                msg = None
             client_resources.update_remote_client_dict(get_service(server, session_key_SK, "list"))
             user = client_resources.get_user_from_remote_client_dict(split_string[1])
             if split_string[1] == client_resources.logged_in_user:
@@ -458,6 +520,16 @@ if __name__ == "__main__":
         ip = '0.0.0.0'
 
     try:
+        
+        HISTORY_FILE = os.path.expanduser("~/.clients_app_history")
+
+        # Load history at startup
+        if os.path.exists(HISTORY_FILE):
+            readline.read_history_file(HISTORY_FILE)
+
+        # Save history on exit
+        atexit.register(readline.write_history_file, HISTORY_FILE)
+
         signal.signal(signal.SIGINT, signal_signint_handler)
         lc.start_listening_client(ip)
         client_resources.create_this_client_rsa_cipher()

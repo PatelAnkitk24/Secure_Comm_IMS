@@ -151,8 +151,6 @@ def handle_lc_client(conn: socket.socket, addr):
         response, c2c_session_key_SK = remote_client_auth(conn, addr)
         if response == 0:
             c2c_session(conn, c2c_session_key_SK)
-            # serve_to_client(conn, addr)
-            pass
         else:
             _log.logging.error(f"Error: Login Failed from {addr}")
     except Exception as e:
@@ -161,7 +159,6 @@ def handle_lc_client(conn: socket.socket, addr):
         conn.close()
         return
     finally:
-        # remove_client_from_online_list(addr[0],addr[1])
         conn.close()
         return 
 

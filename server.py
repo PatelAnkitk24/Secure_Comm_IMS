@@ -17,30 +17,19 @@ import time
 import _log
 from utils import *
 import traceback
+from Crypto.Protocol.KDF import PBKDF2
+import getpass
+import logging
+import pickle
+import server_resources
 
-rsa_priv_cipher = None
 server_sock = None
 # Simulated weak password database for demo (in real systems, this would be hashed and salted)
-user_db = [
-    {
-        "username": "alice",
-        "salt": b"static_salt",
-        "W": b'\xea\x87\xc1\xb426\xf2G3\x01\x01\xfd\xb6\x82)\x8a\xf3\x8c\xf6\x91\xd7:z\xd4{4\x89\xecv\xa2\xdf\xd4' #pass = 123, W = derive_password_key(password, b'static_salt') # W with len 32 byte
-    },
-    {
-        "username": "bob",
-        "salt": b"static_salt",
-        "W": b'\\k\xf4\xb7\x02\xc7\xbd\t\x13]\xb6J\x84\x98\x0f\x9fx\xbe\xa5-M~\x94\x11x\xe5\\\xdbG\xb3\x1a\xeb' #pass = 1234, W = derive_password_key(password, b'static_salt') # W with len 32 byte
-    },
-    {
-        "username": "martin",
-        "salt": b"static_salt",
-        "W": b'\xbe\xed%\xbfu\xfe\x9fk\x02k\xac\x9a\xb0P;\xa2S\xae\x81\xd9kd\xb4\xb0^\xf6\xcd\xeeY\xed\xa5\xe4' #pass = 4321, W = derive_password_key(password, b'static_salt') # W with len 32 byte
-    }
-]
+user_db = None
 
 online_users = {}  # username -> {ip, port, ephemeral_pub}
 online_users_sharable = {}
+logout_user_dict = {}
 
 def get_user_entry(username):
     for user in user_db:
@@ -54,9 +43,6 @@ def get_user_w(username):
         return user["W"]
     return None
     
-def decrypt_client_login_aes_key(rsa_enc_aes_key):
-    return rsa_priv_cipher.decrypt(rsa_enc_aes_key)
-
 def client_login(conn: socket.socket, addr):
     global online_users
     client_login_sub_payload = {}
@@ -79,7 +65,7 @@ def client_login(conn: socket.socket, addr):
         try:
             if client_login_payload["type"] == "login":
                 # Get AES Key and decrypt sub payload 
-                client_login_aes_key = decrypt_client_login_aes_key(b64decode(client_login_payload["rsa_enc_client_login_aes_key"]))
+                client_login_aes_key = server_resources.decrypt_client_login_aes_key(b64decode(client_login_payload["rsa_enc_client_login_aes_key"]))
                 #_log.logging.debug(f"aes_key {aes_key}")
                 received_client_login_sub_payload = json.loads(aes_decrypt(client_login_aes_key, b64decode(client_login_payload["aes_enc_client_login_sub_payload"])).decode())
                 #_log.logging.debug(f"received_sub_payload {received_sub_payload}")
@@ -309,6 +295,12 @@ def get_user_by_ip(ip_address, port):
             return user_info
     return None  # If not found
 
+def get_user_by_name(u_name):
+    for user_info in online_users.values():
+        if user_info["username"] == u_name:
+            return user_info
+    return None  # If not found
+
 def remove_client_from_online_list(ip_address, port):
     u_name = None
     for username, user_info in list(online_users.items()):
@@ -331,30 +323,91 @@ def serve_to_client(conn : socket.socket, addr):
     session_key_SK = b64decode(user["session_key_SK"])
     #_log.logging.debug(f"user list : \n {user}")
     while True and user:
-        type_, msg = recv_tlv(conn)
+        type_, enc_msg = recv_tlv(conn)
         if type_ == LIST_FRAME_T:
-            request = json.loads(aes_decrypt(session_key_SK, msg).decode())
+            request = json.loads(aes_decrypt(session_key_SK, enc_msg).decode())
             if request["command"] == "list":
-                _log.logging.info(f"Request for list: User {user['username']} with ip {user['ip']}")
+                _log.logging.info(f"Request for list: From User {user['username']} with ip {user['ip']}")
                 if is_not_a_replay(request["time"]):
                     reply = aes_encrypt(session_key_SK, json.dumps(online_users_sharable).encode())
                     send_tlv(conn,LIST_FRAME_T,reply)
                 else:
                     _log.logging.error(f"Error: Replay attack from User {user['username']} with ip {user['ip']}")
-                    break;    
+                    continue
             else:
                 _log.logging.error(f"Error: Unknown command {request['command'] } from User {user['username']} with ip {user['ip']}")
-                break
+                continue
+        elif type_ == LOGOUT_FRAME_1_T:
+            request = json.loads(aes_decrypt(session_key_SK, enc_msg).decode())
+            if request["command"] != "logout":
+                _log.logging.error(f"Error: Unknown command {request['command'] } from User {user['username']} with ip {user['ip']}")
+                continue
+            if is_a_replay(request["time"]):
+                _log.logging.error(f"Error: Logout frame 1 Replay attack from User {user['username']} with ip {user['ip']}")
+                continue
+                
+            if user['username'] != request["username"]:
+                e_msg = f"[X] Logout Failed as User {user['username']} Requested logout for {request['username']}"
+                _log.logging.error(e_msg)
+                msg_bytes = e_msg.encode('utf-8')
+                send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, msg_bytes)
+            
+            if not is_user_in(online_users_sharable, request["username"]):
+                e_msg= f"[X] Error: Can't Log out User {request['username']}, as it is Not Logged in"
+                _log.logging.error(e_msg)
+                msg_bytes = e_msg.encode('utf-8')
+                send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, msg_bytes)
+                continue
+            
+            _log.logging.info(f"Request for logout: From User {user['username']} with ip {user['ip']}")
+            logout_payload = {
+                "command": "logout",
+                "username": "server",
+                "time": time.time()
+            }
+            reply = aes_encrypt(session_key_SK, json.dumps(logout_payload).encode())
+            send_tlv(conn,LOGOUT_FRAME_1_T,reply)
+            logout_user_dict[request["username"]] = 'logout_1'
+        elif type_ == LOGOUT_FRAME_2_T:
+            request = json.loads(aes_decrypt(session_key_SK, enc_msg).decode())
+            if request["command"] != "logout":
+                _log.logging.error(f"Error: Unknown command {request['command'] } from User {user['username']} with ip {user['ip']}")
+                continue    
+            if is_a_replay(request["time"]):
+                _log.logging.error(f"Error: Logout frame 2 Replay attack from User {user['username']} with ip {user['ip']}")
+                continue 
+            
+            if request["username"] not in logout_user_dict:
+                e_msg= f"[X] Error: Can't Log out User {request['username']}, as frame LOGOUT_FRAME_1_T was not received"
+                _log.logging.error(e_msg)
+                msg_bytes = e_msg.encode('utf-8')
+                send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, msg_bytes)
+                continue
+
+            _log.logging.info(f"Request for logout confrimation: From User {user['username']} with ip {user['ip']}")
+            logout_payload = {
+                "command": "logout",
+                "username": "server",
+                "time": time.time()
+            }
+            reply = aes_encrypt(session_key_SK, json.dumps(logout_payload).encode())
+            send_tlv(conn,LOGOUT_FRAME_2_T,reply)
+            
+            del logout_user_dict[request["username"]]
+            remove_client_from_online_list(addr[0], addr[1])
+        elif type_ == None:
+            logging.warning(f"Socket closed or bad data from {user['username']} at {addr[0]}. Closing connection.")
+            break
         else:
             _log.logging.error(f"Error: Unknown frame {type_} from User {user['username']} with ip {user['ip']}")
-            break
-    remove_client_from_online_list(addr[0],addr[1])
+            continue
 
 def handle_client(conn: socket.socket, addr):
     try: 
         response = client_login(conn, addr)
         if response == 0:
             serve_to_client(conn, addr)
+            remove_client_from_online_list(addr[0],addr[1])
         else:
             _log.logging.error(f"Error: Login Failed from {addr}")
             remove_client_from_online_list(addr[0],addr[1])
@@ -392,18 +445,9 @@ def signal_signint_handler(sig, frame):
     _log.logging.info("🔴 Caught Ctrl+C (SIGINT)")
     cleanup()
 
-if __name__ == "__main__":
-    if not os.path.exists("server_private.pem") or not os.path.exists("server_public.pem"):
-        _log.logging.info("[KEYGEN] Generating RSA key pair...")
-        key = RSA.generate(4096)
-        with open("server_private.pem", "wb") as priv_file:
-            priv_file.write(key.export_key())
-        with open("server_public.pem", "wb") as pub_file:
-            pub_file.write(key.publickey().export_key())
-        _log.logging.info("[KEYGEN] Keys saved.")
 
-    with open("server_private.pem", "rb") as f:
-        private_key = RSA.import_key(f.read())
-    rsa_priv_cipher = PKCS1_OAEP.new(private_key)
+if __name__ == "__main__":
+    key, password = server_resources.load_keys()
+    user_db = server_resources.load_user_db_record(password)
     signal.signal(signal.SIGINT, signal_signint_handler)
     start_server()

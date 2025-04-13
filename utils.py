@@ -16,6 +16,8 @@ LIST_FRAME_T = 2
 RC_AUTH_FRAME_T = 3
 LOGIN_ERR_MSG_FRAME_T = 4
 C2C_MSG_FRAME_T = 5
+LOGOUT_FRAME_1_T = 6
+LOGOUT_FRAME_2_T = 7
 def send_tlv(sock: socket.socket, msg_type: int, value: bytes):
     """
     Sends a TLV frame: 1-byte type, 4-byte length, followed by value.
