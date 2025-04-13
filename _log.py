@@ -34,4 +34,4 @@ logger.addHandler(console_handler)
 def is_level_debug():
     return logging.getLevelName(logging.getLogger().getEffectiveLevel()) == "DEBUG"
 
-print(is_level_debug())
+# print(is_level_debug())

@@ -15,6 +15,8 @@ import signal
 import sys
 import time
 import _log
+from utils import *
+import traceback
 
 rsa_priv_cipher = None
 server_sock = None
@@ -62,9 +64,14 @@ def client_login(conn: socket.socket, addr):
     g_b = None #DH client public key
     dh_shared_K_bytes = None
     try:
-        type, decoded_login_payload  = recv_tlv(conn)
-        if type != LOGIN_FRAME_T:
+        
+        '''
+        First Login transaction from client to server
+        '''
+        type_, decoded_login_payload = recv_tlv(conn)
+        if type_ != LOGIN_FRAME_T:
             _log.logging.error("Error: Not A Login Frame")
+            send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, b"[X] Error: Not A Login Frame")
             conn.close()
             return None
         client_login_payload = json.loads(decoded_login_payload.decode())
@@ -81,7 +88,7 @@ def client_login(conn: socket.socket, addr):
                 client_login_sub_payload["username"] = received_client_login_sub_payload["username"]
                 if is_user_in(online_users_sharable, client_login_sub_payload["username"]):
                     _log.logging.error("[X] Error: User Already Logged in")
-                    conn.send(b"[X] Error: User Already Logged in")
+                    send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, b"[X] Error: User Already Logged in")
                     conn.close()
                     return None
                 
@@ -89,26 +96,30 @@ def client_login(conn: socket.socket, addr):
                 W = get_user_w(client_login_sub_payload["username"])
                 if W == None:
                     _log.logging.error("[X] Error: User not found")
-                    conn.send(b"Error: User not found")
+                    send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"Error: User not found"))
                     conn.close()
                     return None
                 enc_ga = b64decode(received_client_login_sub_payload["Wga"])
-                client_login_sub_payload["ga"] = int(aes_decrypt(W,enc_ga))
+                try:
+                    client_login_sub_payload["ga"] = int(aes_decrypt(W,enc_ga))
+                except Exception as e:
+                    send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"Error: Wrong Password"))
+                    # _log.logging.error(f"[ERROR] {e}")
+                    _log.logging.error(f"[ERROR]  Wrong Password")
+                    conn.close()
+                    return None
+                    # traceback.print_exc()
+                    # raise
                 
                 # Get pKc, port, time
                 client_login_sub_payload["pKc"] = b64decode(received_client_login_sub_payload["pKc"])
                 client_login_sub_payload["c_port"] = received_client_login_sub_payload["c_port"]
                 client_login_sub_payload["time"] = received_client_login_sub_payload["time"]
                 #_log.logging.debug(f"client_login_sub_payload {client_login_sub_payload}")
-                now = time.time()
-                if "time" not in client_login_sub_payload:
-                    _log.logging.error("Error: [REPLAY] Timestamp not present.")
-                    conn.send(b"Error: Timestamp not present")
-                    conn.close()
-                    return None
+                
                 if is_a_replay(client_login_sub_payload["time"]):
                     _log.logging.error("Error: [REPLAY] Timestamp expired.")
-                    conn.send(b"Error: Timestamp too old.")
+                    send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"Error: Timestamp too old."))
                     conn.close()
                     return None
                 _log.logging.info("[✓] Successfully reception of client's login payload")
@@ -155,15 +166,14 @@ def client_login(conn: socket.socket, addr):
                 _log.logging.info("[✓] Successfully transmission of server's login payload")
                 time.sleep(2)
                 # Send response: W{g^b} + optional server pub key
-                conn.send(json.dumps(server_login_payload).encode())
+                send_tlv(conn, LOGIN_FRAME_T, json.dumps(server_login_payload).encode())
                 b = g_b = 0 # Forget private and public DH keys for PFS
                 
             else:
                 _log.logging.error("Error: expecting login type frame")
-                conn.send(b"Error: expecting login type frame")
+                send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"Error: expecting login type frame"))
                 conn.close()
                 return None
-            pass
             
             '''
             Proof Of Work
@@ -173,50 +183,84 @@ def client_login(conn: socket.socket, addr):
             challenge_data = json.dumps({"challenge": prefix, "difficulty": difficulty}).encode()
             #_log.logging.debug(f"challange_data {challenge_data}")
             enc_challenge = aes_encrypt(dh_shared_K_bytes, challenge_data)
-            conn.send(enc_challenge)
+            send_tlv(conn, LOGIN_FRAME_T, enc_challenge)
             
             # Receive encrypted PoW response and validate
-            # tyepe, enc_nonce  = recv_tlv(conn)
-            enc_nonce = conn.recv(4096)
-            nonce_data = json.loads(aes_decrypt(dh_shared_K_bytes, enc_nonce).decode())
-            _log.logging.info("[✓] Successfully Reception of Proof-Of-Work")
-            if not validate_proof(prefix, nonce_data.get("nonce"), difficulty):
-                _log.logging.error("Error: Invalid PoW")
-                conn.send(b"Error: Invalid PoW")
+            # tyep, enc_nonce  = recv_tlv(conn)
+            type_, received_login_payload  = recv_tlv(conn)
+            if type_ == LOGIN_ERR_MSG_FRAME_T:
+                _log.logging.error(f"[✓] Login Failed With Message From Client : {decoded_login_payload.decode()}")
                 conn.close()
                 return None
+            if type_ != LOGIN_FRAME_T:
+                _log.logging.error("Error: Not A Login Frame")
+                conn.close()
+                return None
+            nonce_data = json.loads(aes_decrypt(dh_shared_K_bytes, received_login_payload).decode())
+            _log.logging.info("[✓] Successfully Reception of Proof-Of-Work")
+            if not validate_proof(prefix, nonce_data.get("nonce"), difficulty):
+                _log.logging.error("Error: Invalid PoW-Response")
+                send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"Error: Invalid PoW-Response"))
+                conn.close()
+                return None
+            send_tlv(conn, LOGIN_FRAME_T, aes_encrypt(dh_shared_K_bytes,(b"Correct PoW-Response")))
             _log.logging.info("[✓] Successfully Verification of Proof-Of-Work")
 
             '''
-            Session Key Exchange
+            Transaction form client to server for Session Key Exchange
             '''
             # Step 1: Receive {SK, enc_c3} from client
-            enc_msg1 = conn.recv(2048)
+            type_, received_login_payload  = recv_tlv(conn)
+            if type_ == LOGIN_ERR_MSG_FRAME_T:
+                _log.logging.error(f"[✓] Login Failed With Message From Client : {decoded_login_payload.decode()}")
+                conn.close()
+                return None
+            if type_ != LOGIN_FRAME_T:
+                _log.logging.error("Error: Not A Login Frame")
+                conn.close()
+                return None
             #_log.logging.debug(f"enc_msg1 {enc_msg1}")
-            msg1 = json.loads(aes_decrypt(dh_shared_K_bytes, enc_msg1).decode())
+            msg1 = json.loads(aes_decrypt(dh_shared_K_bytes, received_login_payload).decode())
             session_key_SK = b64decode(msg1["SK"])
             enc_c3 = b64decode(msg1["enc_c3"])
             c3 = json.loads(aes_decrypt(session_key_SK, enc_c3).decode())["c3"]
             #_log.logging.debug(f"c3 {c3}")
 
+            '''
+            Transaction form server to client for Session Key Exchange
+            '''
             # Step 2: Generate random c4, respond with {SK{c3-1, c4}} double encrypted
             c4 = random.randint(100, 999)
             c3_check_payload = json.dumps({"c3_check": c3 - 1, "c4": c4}).encode()
             enc_payload = aes_encrypt(session_key_SK, c3_check_payload)
             msg2 = json.dumps({"enc_response": b64encode(enc_payload).decode()}).encode()
             enc_msg2 = aes_encrypt(dh_shared_K_bytes, msg2)
-            conn.send(enc_msg2)
+            send_tlv(conn, LOGIN_FRAME_T, enc_msg2)
 
+            '''
+            Transaction form client to server for Session Key Exchange
+            '''
             # Step 3: Receive and validate {SK{c4-1}} from client
-            enc_msg3 = conn.recv(2048)
-            msg3 = json.loads(aes_decrypt(dh_shared_K_bytes, enc_msg3).decode())
+            type_, received_login_payload  = recv_tlv(conn)
+            if type_ == LOGIN_ERR_MSG_FRAME_T:
+                _log.logging.error(f"[✓] Login Failed With Message From Client : {decoded_login_payload.decode()}")
+                conn.close()
+                return None
+            if type_ != LOGIN_FRAME_T:
+                _log.logging.error("Error: Not A Login Frame")
+                conn.close()
+                return None
+            msg3 = json.loads(aes_decrypt(dh_shared_K_bytes, received_login_payload).decode())
             enc_c4_check = b64decode(msg3["enc_c4_check"])
             c4_check = json.loads(aes_decrypt(session_key_SK, enc_c4_check).decode())["c4_check"]
 
             if c4_check != c4 - 1:
                 _log.logging.error("[X] c4 verification failed.")
+                send_tlv(conn, LOGIN_ERR_MSG_FRAME_T, (b"[X] c4 verification failed."))
                 conn.close()
                 return None
+            else:
+                send_tlv(conn, LOGIN_FRAME_T, aes_encrypt(session_key_SK,(b"OK")))
             
             if not _log.is_level_debug():
                 _log.logging.info(f"[✓] Final session key established")
@@ -245,10 +289,12 @@ def client_login(conn: socket.socket, addr):
             return 0
         except Exception as e:
             _log.logging.error(f"[ERROR] {e}")
+            traceback.print_exc()
             raise
             
     except Exception as e:
         _log.logging.error(f"[ERROR] {e}")
+        traceback.print_exc()
         raise
 
 def is_user_in(online_users_sharable, u_name):
@@ -274,8 +320,9 @@ def remove_client_from_online_list(ip_address, port):
         if u_name and user_info["username"] == u_name:
             online_users_sharable.pop(username)
     
-    _log.logging.info(f"User: {u_name} removed from online list")
-    _log.logging.info(f"User: {u_name} went offline")
+    if u_name:
+        _log.logging.info(f"User: {u_name} removed from online list")
+        _log.logging.info(f"User: {u_name} went offline")
 
 def serve_to_client(conn : socket.socket, addr):
     # _log.logging.debug(f"clients addr {addr}")
@@ -301,6 +348,7 @@ def serve_to_client(conn : socket.socket, addr):
         else:
             _log.logging.error(f"Error: Unknown frame {type_} from User {user['username']} with ip {user['ip']}")
             break
+    remove_client_from_online_list(addr[0],addr[1])
 
 def handle_client(conn: socket.socket, addr):
     try: 
@@ -308,13 +356,14 @@ def handle_client(conn: socket.socket, addr):
         if response == 0:
             serve_to_client(conn, addr)
         else:
-            _log.logging.error("Error: Login Failed from {addr}")
+            _log.logging.error(f"Error: Login Failed from {addr}")
             remove_client_from_online_list(addr[0],addr[1])
     except Exception as e:
         remove_client_from_online_list(addr[0],addr[1])
+        _log.logging.error(f"[ERROR] {e}")
         conn.close()
+        traceback.print_exc()
     finally:
-        remove_client_from_online_list(addr[0],addr[1])
         conn.close()
 
 
@@ -322,9 +371,9 @@ def start_server():
     global server_sock
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(('0.0.0.0', 9999))
+    server_sock.bind((u_config_["server_ip"], u_config_['server_port']))
     server_sock.listen()
-    _log.logging.info("[SERVER] Listening on port 9999...")
+    _log.logging.info(f"[SERVER] Listening on port {u_config_['server_port']} ...")
     while True:
         conn, addr = server_sock.accept()
         threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()

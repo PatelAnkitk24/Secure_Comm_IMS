@@ -14,12 +14,15 @@ import signal
 import sys
 import time
 import _log
+import listening_client as lc
+from utils import *
+import argparse
+import psutil
+import client_resources
+import traceback
 
-server_sock = None
-logged_in_user = None
-def load_config():
-    with open("config.json") as f:
-        return json.load(f)
+live_client_session = {}
+
 
 def get_user_pass_as_W():
     username = input("Username: ")
@@ -31,12 +34,6 @@ def get_user_pass_as_W():
     password = None
     return username,W
 
-def gen_eph_rsa_keys():
-    key = RSA.generate(4096)
-    c_priv = key.export_key()
-    c_pub = key.publickey().export_key()
-    return c_priv, c_pub
-
 def load_server_server_pub_key():
     # Load server public RSA key
     with open("server_public.pem", "rb") as f:
@@ -44,10 +41,7 @@ def load_server_server_pub_key():
     server_rsa_pub_cipher = PKCS1_OAEP.new(server_pub_key)
     return server_rsa_pub_cipher
 
-def client_login():
-    global server_sock
-    global logged_in_user
-    config = load_config()
+def client_login(ip):
     username,W = get_user_pass_as_W()    
     server_rsa_pub_cipher = load_server_server_pub_key()
 
@@ -57,34 +51,31 @@ def client_login():
     encrypted_ga = aes_encrypt(W, str(g_a).encode())
     b64_enc_ga = b64encode(encrypted_ga).decode()
 
-    #Generate ephemeral RSA keys of clieny
-    c_rsa_priv, c_rsa_pub = gen_eph_rsa_keys()
-
     # 1. Generate AES key for login
     client_login_aes_key = get_random_bytes(32)
     enc_client_login_aes_key = server_rsa_pub_cipher.encrypt(client_login_aes_key)
-
     # Prepare full RSA-AES-wrapped login payload
     client_login_sub_payload = {
         "username": username,
         "Wga": b64_enc_ga,
-        "pKc": b64encode(c_rsa_pub).decode(),
-        "c_port": config["client_port"],
+        "pKc": b64encode(client_resources.this_client_eph_pub).decode(),
+        "c_port": u_config_["client_port"],
         "time": time.time()
     }
     enc_client_login_sub_payload = aes_encrypt(client_login_aes_key, json.dumps(client_login_sub_payload).encode())
-    cleint_login_payload = {
+    client_login_payload = {
         "type": "login",
         "rsa_enc_client_login_aes_key": b64encode(enc_client_login_aes_key).decode(),
         "aes_enc_client_login_sub_payload" : b64encode(enc_client_login_sub_payload).decode()
     }
 
     # Connect to server and send RSA-wrapped login
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.settimeout(5)  # Optional: set a timeout for connection attempt
-    
+    client_resources.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client_resources.server_sock.settimeout(5)  # Optional: set a timeout for connection attempt
+    client_resources.server_sock.bind((ip, 0)) # 0 means ephemeral port
+
     try:
-        server_sock.connect((config["server_ip"], config["server_port"]))
+        client_resources.server_sock.connect((u_config_["server_ip"], u_config_["server_port"]))
         _log.logging.info("[✓] Connected to server.")
     except socket.timeout:
         _log.logging.error("⏱ Connection attempt timed out.")
@@ -94,18 +85,23 @@ def client_login():
         _log.logging.error(f"[!] OS error occurred: {e}")
         cleanup()
 
-    send_tlv(server_sock, LOGIN_FRAME_T, json.dumps(cleint_login_payload).encode())
-    # server_sock.send(json.dumps(cleint_login_payload).encode())
+    send_tlv(client_resources.server_sock, LOGIN_FRAME_T, json.dumps(client_login_payload).encode())
+    # client_resources.server_sock.send(json.dumps(client_login_payload).encode())
     _log.logging.info("[✓] Successfully transmission of client's login payload")
     #exit()
 
     '''
     Second Login transaction from server to client
     '''
-    c_rsa_priv_key = RSA.import_key(c_rsa_priv)
-    client_rsa_priv_cipher = PKCS1_OAEP.new(c_rsa_priv_key)
+    # c_rsa_priv_key = RSA.import_key(c_rsa_priv)
+    # client_rsa_priv_cipher = PKCS1_OAEP.new(c_rsa_priv_key)
+
     # Receive encrypted W{g^b mod p} and server pub key
-    server_login_payload = json.loads(server_sock.recv(4096).decode())
+    type_, received_login_payload  = recv_tlv(client_resources.server_sock)
+    if type_ == LOGIN_ERR_MSG_FRAME_T:
+        _log.logging.error(f"[X] Login Failed With Message From Server : {received_login_payload.decode()}")
+        cleanup()
+    server_login_payload = json.loads(received_login_payload.decode())
     server_login_sub_payload = {}
     try:
         if server_login_payload["type"] == "login":
@@ -113,7 +109,7 @@ def client_login():
             '''
             Perfect Forward Secrecy
             '''
-            server_login_aes_key = client_rsa_priv_cipher.decrypt(b64decode(server_login_payload["rsa_enc_server_login_aes_key"]))
+            server_login_aes_key = client_resources.this_client_rsa_priv_cipher.decrypt(b64decode(server_login_payload["rsa_enc_server_login_aes_key"]))
             #_log.logging.debug(f"server_login_aes_key {server_login_aes_key}")
             received_server_login_sub_payload = json.loads(aes_decrypt(server_login_aes_key, b64decode(server_login_payload["aes_enc_server_login_sub_payload"])).decode())
 
@@ -129,26 +125,46 @@ def client_login():
             a = g_a = 0 # Forget private and public DH keys for PFS
             
             server_login_sub_payload["time"] = received_server_login_sub_payload["time"]
-            
+            if is_a_replay(server_login_sub_payload["time"]):
+                _log.logging.error("Error: [REPLAY] Timestamp expired.")
+                cleanup()
+
             '''
-            Proof Of Work
+            Transaction From server to client for Proof Of Work
             '''
             # Receive encrypted challenge from server (using K)
-            enc_challenge = server_sock.recv(4096)
-            challenge_json = json.loads(aes_decrypt(dh_shared_K_bytes, enc_challenge).decode())
+            type_, received_login_payload  = recv_tlv(client_resources.server_sock)
+            if type_ == LOGIN_ERR_MSG_FRAME_T:
+                _log.logging.error(f"[X] Login Failed With Message From Server : {received_login_payload.decode()}")
+                cleanup()
+            if type_ != LOGIN_FRAME_T:
+                _log.logging.error("Error: Not A Login Frame")
+                cleanup()
+            challenge_json = json.loads(aes_decrypt(dh_shared_K_bytes, received_login_payload).decode())
             #_log.logging.debug(f"challenge_json {challenge_json}")
             #_log.logging.debug(f"[CHALLENGE] Solve {challenge_json['challenge']} with difficulty {challenge_json['difficulty']}")
-
+           
+            '''
+            Transaction From client to server with Proof Of Work response
+            '''
             # Solve and respond with encrypted proof
             nonce = solve_proof(challenge_json["challenge"], challenge_json["difficulty"])
             enc_nonce = aes_encrypt(dh_shared_K_bytes, json.dumps({"nonce": nonce}).encode())
-            server_sock.send(enc_nonce)
+            send_tlv(client_resources.server_sock, LOGIN_FRAME_T, enc_nonce)
             _log.logging.info("[✓] Successfully Transmission of Proof-Of-Work")
 
+            type_, received_login_payload  = recv_tlv(client_resources.server_sock)
+            if type_ == LOGIN_ERR_MSG_FRAME_T:
+                _log.logging.error(f"[X] Login Failed With Message From Server : {received_login_payload.decode()}")
+                cleanup()
+            if type_ != LOGIN_FRAME_T:
+                _log.logging.error("Error: Not A Login Frame")
+                cleanup()
+            _log.logging.info(f"[✓] Message From Server : {aes_decrypt(dh_shared_K_bytes, received_login_payload).decode()}")
+
             '''
-            Session Key Exchange
-            '''
-            
+            Transaction form client to server Session Key Exchange
+            ''' 
             # Step 1: Generate session key SK and random c3
             session_key_SK = get_random_bytes(32)
             c3 = random.randint(100, 999)
@@ -160,11 +176,20 @@ def client_login():
             }
             enc_msg1 = aes_encrypt(dh_shared_K_bytes, json.dumps(msg1).encode())
             #_log.logging.debug(f"enc_msg1 {enc_msg1}")
-            server_sock.send(enc_msg1)
+            send_tlv(client_resources.server_sock, LOGIN_FRAME_T, enc_msg1)
 
+            '''
+            Transaction form server to client for Session Key Exchange
+            '''
             # Step 2: Receive and decrypt server response
-            enc_msg2 = server_sock.recv(2048)
-            msg2 = json.loads(aes_decrypt(dh_shared_K_bytes, enc_msg2).decode())
+            type_, received_login_payload  = recv_tlv(client_resources.server_sock)
+            if type_ == LOGIN_ERR_MSG_FRAME_T:
+                _log.logging.error(f"[X] Login Failed With Message From Server : {received_login_payload.decode()}")
+                cleanup()
+            if type_ != LOGIN_FRAME_T:
+                _log.logging.error("Error: Not A Login Frame")
+                cleanup()
+            msg2 = json.loads(aes_decrypt(dh_shared_K_bytes, received_login_payload).decode())
             enc_response = b64decode(msg2["enc_response"])
             response = json.loads(aes_decrypt(session_key_SK, enc_response).decode())
     
@@ -172,73 +197,48 @@ def client_login():
                 _log.logging.error("[X] c3 verification failed.")
                 cleanup()
             c4 = response["c4"]
-            
+
+            '''
+            Transaction form client to server for Session Key Exchange
+            '''
             # Step 3: Send SK_check = c4 - 1 encrypted with SK, then with shared_K
             enc_msg3 = aes_encrypt(session_key_SK, json.dumps({"c4_check": c4 - 1}).encode())
             final_msg = aes_encrypt(dh_shared_K_bytes, json.dumps({"enc_c4_check": b64encode(enc_msg3).decode()}).encode())
-            server_sock.send(final_msg)
+            send_tlv(client_resources.server_sock, LOGIN_FRAME_T, final_msg)
 
+            type_, received_login_payload  = recv_tlv(client_resources.server_sock)
+            if type_ == LOGIN_ERR_MSG_FRAME_T:
+                _log.logging.error(f"[X] Login Failed With Message From Server : {received_login_payload.decode()}")
+                cleanup()
+            if type_ != LOGIN_FRAME_T:
+                _log.logging.error("Error: Not A Login Frame")
+                cleanup()
+            _log.logging.info(f"[✓] Login Sucess With Message From Server : {aes_decrypt(session_key_SK, received_login_payload).decode()}")
             _log.logging.info(f"[+] Final session key established: {session_key_SK.hex()}")
-            logged_in_user = username
-            return server_sock, session_key_SK
+            client_resources.logged_in_user = username
+            return client_resources.server_sock, session_key_SK
         else:
-            server_sock.send(b"Error: expecting login type frame from server")
+            client_resources.server_sock.send(b"Error: expecting login type frame from server")
             cleanup()
     except Exception as e:
         _log.logging.error(f"[ERROR] {e}")
+        traceback.print_exc()
         raise
     
-def get_list_from_server(server: socket.socket, session_key_SK):
-    
-    # Send List Command
-    request = aes_encrypt(session_key_SK, json.dumps({"command": "list", "time": time.time()}).encode())
-    send_tlv(server, LIST_FRAME_T, request)
-    type_, msg = recv_tlv(server)
-    if type_ == LIST_FRAME_T:
-        response = json.loads(aes_decrypt(session_key_SK, msg).decode())
-        # _log.logging.debug(f"User List From Server : \n{response}")
-        return response
-    else:
-        _log.logging.error(f"Error: Unexpected resposne from server with type {type_}")
-        return None
-
 
 def get_service(server: socket.socket, session_key_SK, command):
     if command == "list":
-        return get_list_from_server(server, session_key_SK)
+        return client_resources.get_list_from_server(server, session_key_SK)
     else:
         return None
-    
-def show_c_list(c_dict:dict):
-    for user in c_dict.values():
-        print(f"Name: {user['username']:<13} IP: {user['ip']:<15} Port: {user['port']:<5}")
 
-supported_cmd_list = ['list', 'user <username>', 'help']
-def main():
-    server, session_key_SK = client_login()
-    while True and server:
-        command = input("cmd>")
-        if command == "help":
-            _log.logging.info(f"Supported command list -> {supported_cmd_list}")
-        elif command == "list":
-            c_dict = get_service(server, session_key_SK, command)
-            if c_dict  == None:
-                break
-            show_c_list(c_dict)
-        elif command == "user":
-            pass
-        else:
-            _log.logging.error(f"Error: Unexpected command {command}")
-            _log.logging.info(f"Supported command list -> {supported_cmd_list}")
-    cleanup()
-    
 def cleanup():
-    global server_sock
     _log.logging.info("[🧹] Cleaning up resources...")
-    if server_sock != None :
+    if client_resources.server_sock != None :
         _log.logging.info("[🧹] Closing Server Socket For Graceful Termination")
-        server_sock.close()
+        client_resources.server_sock.close()
         time.sleep(1)
+    lc.cleanup()
     # Close sockets, save files, etc.
     sys.exit(0)
 
@@ -246,13 +246,186 @@ def signal_signint_handler(sig, frame):
     _log.logging.info("🔴 Caught Ctrl+C (SIGINT)")
     cleanup()
 
+def connect_to_remote_user(user,c_ip):
+    #TODO: is this live_client_session required?
+    global live_client_session
+
+    pKc = b64decode(user['ephemeral_pub'])
+    rc_ip = user['ip']
+    rc_port = user['port']
+    remote_user_name = user['username']
+    
+    '''
+    Send remote user auth payload
+    '''    
+    remote_client_rsa_pub_cipher = PKCS1_OAEP.new(RSA.import_key(pKc))
+
+    this_client_auth_aes_key = get_random_bytes(32)
+    c2c_session_key_SK = get_random_bytes(32)
+    enc_this_client_auth_aes_key = remote_client_rsa_pub_cipher.encrypt(this_client_auth_aes_key)
+    # Prepare full RSA-AES-wrapped remote client auth sub payload
+    c1 = random.randint(100, 999)
+    enc_c1 = aes_encrypt(c2c_session_key_SK, json.dumps({"c1": c1}).encode())
+    this_client_auth_sub_payload = {
+        "username": client_resources.logged_in_user,
+        "SK": b64encode(c2c_session_key_SK).decode(),
+        "enc_c1": b64encode(enc_c1).decode(),
+        "time": time.time()
+    }
+    enc_this_client_auth_sub_payload = aes_encrypt(this_client_auth_aes_key, json.dumps(this_client_auth_sub_payload).encode())
+    this_client_auth_payload = {
+        "type": "rc_auth",
+        "rsa_enc_client_auth_aes_key": b64encode(enc_this_client_auth_aes_key).decode(),
+        "aes_enc_client_auth_sub_payload" : b64encode(enc_this_client_auth_sub_payload).decode()
+    }
+
+    # Connect to server and send RSA-wrapped login
+    remote_client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    remote_client_sock.settimeout(5)  # Optional: set a timeout for connection attempt
+    remote_client_sock.bind((c_ip, 0)) # 0 means ephemeral port
+
+    # TODO: decide whether to close remote_client_sock in below exception
+    try:
+        remote_client_sock.connect((rc_ip, rc_port))
+        _log.logging.info(f"[✓] Connected to remote client with IP {rc_ip}, Port {rc_port}.")
+    except socket.timeout:
+        _log.logging.error("⏱ Connection attempt timed out.")
+    except ConnectionRefusedError:
+        _log.logging.error(f"[X] Connection refused by user {remote_user_name} on IP {rc_ip} Port {rc_port} — is the server running?")
+    except OSError as e:
+        _log.logging.error(f"[!] OS error occurred: {e}")
+   # remote_client_cleanup(name)
+
+    send_tlv(remote_client_sock, RC_AUTH_FRAME_T, json.dumps(this_client_auth_payload).encode())
+
+    # client_resources.server_sock.send(json.dumps(remote_client_login_payload).encode())
+    _log.logging.info(f"[✓] Successfully transmission of remote client's auth payload from {client_resources.logged_in_user} to {remote_user_name}")
+
+    '''
+    Receive remote user auth payload
+    '''
+    type_, _remote_client_auth_payload  = recv_tlv(remote_client_sock)
+    if type_ != RC_AUTH_FRAME_T:
+        _log.logging.error("Error: Not Remote Client Auth Frame")
+        remote_client_sock.close()
+        return None
+    remote_client_auth_payload = json.loads(_remote_client_auth_payload.decode())
+    
+    if remote_client_auth_payload["type"] != "rc_auth":
+        _log.logging.error("Error: expecting rc_auth type frame")
+        remote_client_sock.close()
+        return None
+    remote_client_auth_aes_key = client_resources.decrypt_client_auth_aes_key(b64decode(remote_client_auth_payload["rsa_enc_client_auth_aes_key"]))
+    #_log.logging.debug(f"remote_client_auth_aes_key {remote_client_auth_aes_key}")
+    received_remote_client_auth_sub_payload = json.loads(aes_decrypt(remote_client_auth_aes_key, b64decode(remote_client_auth_payload["aes_enc_client_auth_sub_payload"])).decode())
+
+    if is_a_replay(received_remote_client_auth_sub_payload["time"]):
+        _log.logging.error("Error: [REPLAY] Timestamp expired.")
+        remote_client_sock.close()
+        return None
+    remote_client_user_name = received_remote_client_auth_sub_payload["username"]
+    if remote_client_user_name != remote_user_name:
+            _log.logging.error(f"Error: remote_client usernmae mistmatch received user name {remote_client_user_name}, requested user name {remote_user_name}")
+            remote_client_sock.close()
+    enc_c1_check = b64decode(received_remote_client_auth_sub_payload["c1_check"])
+    c1_resp = json.loads(aes_decrypt(c2c_session_key_SK, enc_c1_check).decode())["c1_resp"]
+    if c1_resp != c1 - 1:
+        _log.logging.error("[X] c1 verification failed.")
+    _log.logging.info(f"[✓] Successfully reception of remote client auth payload from {remote_client_user_name} ")
+    
+    '''
+    Proof Of Work
+    '''
+    _log.logging.info("[✓] Successfully Reception of Proof-Of-Work")
+    prefix = received_remote_client_auth_sub_payload["PoW"]["challenge"]
+    difficulty= received_remote_client_auth_sub_payload["PoW"]["difficulty"]
+    nonce = solve_proof(prefix, difficulty)
+    enc_nonce = aes_encrypt(c2c_session_key_SK, json.dumps({"nonce": nonce}).encode())
+    # Prepare full RSA-AES-wrapped remote client PoW response payload
+    this_client_auth_sub_pow_resp_payload = {
+        "username": client_resources.logged_in_user,
+        "PoW-Response": b64encode(enc_nonce).decode(),
+        "time": time.time()
+    }
+    enc_this_client_auth_sub_pow_resp_payload = aes_encrypt(this_client_auth_aes_key, json.dumps(this_client_auth_sub_pow_resp_payload).encode())
+    this_client_auth_pow_resp_payload = {
+        "type": "rc_auth",
+        "rsa_enc_client_auth_aes_key": b64encode(enc_this_client_auth_aes_key).decode(),
+        "aes_enc_client_auth_sub_pow_resp_payload" : b64encode(enc_this_client_auth_sub_pow_resp_payload).decode()
+    }
+    send_tlv(remote_client_sock, RC_AUTH_FRAME_T, json.dumps(this_client_auth_pow_resp_payload).encode())
+
+    # client_resources.server_sock.send(json.dumps(remote_client_login_payload).encode())
+    _log.logging.info(f"[✓] Successfully transmission of remote client's auth pow-response payload from {client_resources.logged_in_user} to {remote_user_name}")    
+    _log.logging.info(f"[+] Authenticated {remote_client_user_name} and established secure session.")
+    
+supported_cmd_list = ['list', 'user <username>', 'help']
+def main(c_ip):
+    server, session_key_SK = client_login(c_ip)
+    client_resources.s_c_session_key_SK = session_key_SK
+    while True and server:
+        command = input("cmd>")
+        if command == "help":
+            _log.logging.info(f"Supported command list -> {supported_cmd_list}")
+        elif command == "list":
+            client_resources.update_remote_client_dict(get_service(server, session_key_SK, command))
+            if client_resources.remote_client_dict["list"]  == None:
+                continue
+            client_resources.show_c_list(client_resources.remote_client_dict["list"])
+        elif "user " in command:
+            split_string = command.split()
+            client_resources.update_remote_client_dict(get_service(server, session_key_SK, "list"))
+            user = client_resources.get_user_from_dict(split_string[1])
+            if split_string[1] == client_resources.logged_in_user:
+                _log.logging.error(f"Can't connect to ownself {user['username']}, check list and try again")
+                continue
+            if user:
+                client_resources.show_c_list(client_resources.remote_client_dict["list"])
+                # session_with_user()
+                connect_to_remote_user(user,c_ip)
+            else:
+                _log.logging.error(f"Can't connect to user {user['username']}, check list and try again")
+                continue
+        elif command == "user":
+            pass
+        else:
+            _log.logging.error(f"Error: Unexpected command {command}")
+            _log.logging.info(f"Supported command list -> {supported_cmd_list}")
+    cleanup()
+
+def get_interface_ip(interface_name):
+    addrs = psutil.net_if_addrs()
+    if interface_name in addrs:
+        for addr in addrs[interface_name]:
+            if addr.family == socket.AF_INET:
+                return addr.address
+    return None
 
 if __name__ == "__main__":
     _log.logging.debug("============== Client ============== ")
+    parser = argparse.ArgumentParser(description="Get network interface info.")
+    parser.add_argument(
+        '--interface', '-i',
+        required=True,
+        help='Network interface to query (e.g., eth0)'
+    )
+
+    args = parser.parse_args()
+    if args.interface:
+        ip = get_interface_ip(args.interface)
+        if ip == None:
+            _log.logging.debug(f"Check interface, retrieved incorrect ip = {ip}")
+            exit(0)
+    else:
+        ip = '0.0.0.0'
+
     try:
         signal.signal(signal.SIGINT, signal_signint_handler)
-        main()
+        lc.start_listening_client(ip)
+        client_resources.create_this_client_rsa_cipher()
+        main(ip)
     except Exception as e:
         _log.logging.error(f"[ERROR] {e}")
+        traceback.print_exc()
         cleanup()
         raise
