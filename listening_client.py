@@ -137,7 +137,14 @@ def c2c_session(conn, c2c_session_key_SK):
             if type_ != C2C_MSG_FRAME_T:
                 _log.logging.error("Error: Not A Remote Client Message Frame")
                 return None
-            payload = json.loads(aes_decrypt(c2c_session_key_SK, enc_payload).decode())
+            try:
+                payload = json.loads(aes_decrypt(c2c_session_key_SK, enc_payload).decode())
+            except Exception as e:
+                _log.logging.error(f"[ERROR] {e}")
+                continue
+            if is_a_replay(payload["time"]):
+                _log.logging.error("Error: [REPLAY] Timestamp expired.")
+                continue
             _log.logging.info(f"Message: From {payload['username']}, msg: '{payload['msg']}'")
     except Exception as e:
         _log.logging.error(f"[ERROR] {e}")

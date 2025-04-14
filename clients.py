@@ -31,7 +31,7 @@ def get_user_pass_as_W():
     password = getpass.getpass("Password: ")
     # Derive W from password
     W = derive_password_key(password, b'static_salt') # W with len 32 byte
-    _log.logging.debug(f"W {W}")
+    # _log.logging.debug(f"W {W}")
     # To loose password to avoid password leak 
     password = None
     return username,W

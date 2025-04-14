@@ -100,10 +100,10 @@ python3 clients.py -i eth0
 - To ease out demo and testing, use port argument with **unique port number** while starting a clients application
 ```bash
 # Terminal 1
-python3 clients.py -i eth0:1 -p 120001
+python3 clients.py -i eth0:1 -p 12001
 
 # Terminal 2
-python3 clients.py -i eth0  -p 120002
+python3 clients.py -i eth0  -p 12002
 ```
 
 ---
