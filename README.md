@@ -86,7 +86,7 @@ python3 server.py
 
 ## 💻 Run the Clients
 
-Open **two terminal windows** and run one client in each, binding to a different interface:
+Open **two terminal windows** and run one client in each, binding to a different interface (just to use different ip), also update the **client_port** in **config.json** file with unique port for each client instance.
 
 ```bash
 # Terminal 1
@@ -111,6 +111,18 @@ When prompted, log in using one of the following users (pre-loaded on the server
 ⚠️ **Note**: There is *no signup flow* — only login is supported for demo purposes.
 
 ---
+
+## Commands
+There are 4 commands supported help, list, user <username> <message>, and help 
+
+To get list of online user connected to server user command
+```
+list
+```
+To get send message to user, use user command as mentioned below
+```
+user alice hi how are you doing?
+```
 
 ## 🧼 Cleanup (optional)
 

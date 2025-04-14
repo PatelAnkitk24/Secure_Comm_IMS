@@ -83,7 +83,7 @@ def update_client_session_resources_against(dict_):
     # Find usernames in remote_client_session_dict that are not in dict_
     for user in remote_client_session_dict:
         if user not in dict_:
-            to_remove.append(user['username'])
+            to_remove.append(user)
 
     # Remove them after iteration (safe removal)
     for username in to_remove:
