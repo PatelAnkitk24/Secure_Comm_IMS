@@ -513,8 +513,19 @@ if __name__ == "__main__":
         required=True,
         help='Network interface to query (e.g., eth0)'
     )
+    
+    parser.add_argument(
+        '--port', '-p',
+        type=int,
+        required=False,
+        help='Port number to connect or listen on (e.g., 8080)'
+    )
 
     args = parser.parse_args()
+
+    if args.port:
+        u_config_["client_port"] = args.port 
+    
     if args.interface:
         ip = get_interface_ip(args.interface)
         if ip == None:

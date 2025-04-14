@@ -86,7 +86,8 @@ python3 server.py
 
 ## 💻 Run the Clients
 
-Open **two terminal windows** and run one client in each, binding to a different interface (just to use different ip), also update the **client_port** in **config.json** file with unique port for each client instance.
+- Open **two terminal windows** and run one client in each, binding to a different interface (just to use different ip).
+- Also update the **client_port** in **config.json** file with unique port for each client instance.
 
 ```bash
 # Terminal 1
@@ -94,6 +95,15 @@ python3 clients.py -i eth0:1
 
 # Terminal 2
 python3 clients.py -i eth0
+```
+
+- To ease out demo and testing, use port argument with **unique port number** while starting a clients application
+```bash
+# Terminal 1
+python3 clients.py -i eth0:1 -p 120001
+
+# Terminal 2
+python3 clients.py -i eth0  -p 120002
 ```
 
 ---
